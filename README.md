@@ -91,3 +91,13 @@ In **My Library**, each shiur has:
 **SRT** (SubRip) works in VLC, YouTube, most video players, and many podcast apps.
 
 **VTT** (WebVTT) is the web-standard subtitle format. It is nearly identical to SRT but uses dots instead of commas in timestamps and starts with a `WEBVTT` header. It works natively with HTML5 `<video>` / `<audio>` and many modern podcast players.
+
+## Quick add from Torah Anytime (phone)
+
+- In Torah Anytime tap **Share → Copy**, open the app, tap **📋 Paste link & transcribe**.
+  (Chrome asks once to allow clipboard access — tap Allow.)
+- Or paste into the box under the button — it starts as soon as a shiur link is detected.
+- Or open `https://shiur-app.streamlit.app/?url=<link or whole share text>` (e.g. from an
+  Android "share to URL" app such as HTTP Shortcuts) and it starts automatically.
+- Whole share messages work: the first lecture link (MyTAT.me/a…, MyTAT.me/v…,
+  torahanytime.com/lectures/…, yutorah.org/…) is picked out; speaker links are ignored.

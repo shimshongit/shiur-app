@@ -256,7 +256,7 @@ def teacher_name(doc: dict) -> str:
 # ---------------------------------------------------------------------------
 # Download
 # ---------------------------------------------------------------------------
-GENERIC_TITLES = {"", "rabbi", "rav", "untitled", "untitled shiur"}
+GENERIC_TITLES = {"", "rabbi", "rav", "r", "mr", "mrs", "dr", "rebbetzin", "untitled", "untitled shiur"}
 
 
 def normalize_source_url(url: str) -> str:
@@ -271,10 +271,51 @@ def normalize_source_url(url: str) -> str:
     )
     if m and ("torahanytime" in url.lower() or "lectures" in url.lower()):
         return f"https://www.torahanytime.com/lectures/{m.group(1)}"
-    m2 = re.search(r"mytat\.me/a(\d+)", url, re.I)
+    m2 = re.search(r"mytat\.me/[av](\d+)", url, re.I)
     if m2:
         return f"https://www.torahanytime.com/lectures/{m2.group(1)}"
     return url
+
+
+_LECTURE_PATTERNS = [
+    # Torah Anytime short links from the app's Share button: MyTAT.me/a123 (audio) / v123 (video)
+    re.compile(r"(?:https?://)?(?:www\.)?mytat\.me/[av](\d+)", re.I),
+    # torahanytime.com/lectures/123, /#/lectures?v=123, ...?v=123
+    re.compile(r"(?:https?://)?(?:www\.)?torahanytime\.com/\S*?(?:lectures/|[?&#]v=)(\d+)", re.I),
+]
+_YUTORAH_PATTERN = re.compile(r"(?:https?://)?(?:www\.)?yutorah\.org/\S+", re.I)
+_ANY_URL_PATTERN = re.compile(r"https?://\S+", re.I)
+_TRAILING_JUNK = ".,;:!?)]}>'\"“”’"
+
+
+def extract_shiur_url(text: str) -> str | None:
+    """Pull the shiur link out of anything: a bare URL, a lecture ID, or a whole share
+    message (e.g. Torah Anytime's "🎥 Video MyTAT.me/v123 🎙 Audio MyTAT.me/a123 ...").
+    Speaker / series links (MyTAT.me/s665) are ignored. Returns a canonical URL or None."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return f"https://www.torahanytime.com/lectures/{text}"
+    best = None  # (position, url)
+    for pat in _LECTURE_PATTERNS:
+        m = pat.search(text)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), f"https://www.torahanytime.com/lectures/{m.group(1)}")
+    m = _YUTORAH_PATTERN.search(text)
+    if m and (best is None or m.start() < best[0]):
+        url = m.group(0).rstrip(_TRAILING_JUNK)
+        if not url.lower().startswith("http"):
+            url = "https://" + url
+        best = (m.start(), url)
+    if best:
+        return best[1]
+    for m in _ANY_URL_PATTERN.finditer(text):
+        url = m.group(0).rstrip(_TRAILING_JUNK)
+        if re.search(r"mytat\.me/|chat\.whatsapp\.com|wa\.me/", url, re.I):
+            continue  # speaker/series short links and WhatsApp invites aren't shiurim
+        return normalize_source_url(url)
+    return None
 
 
 def fix_download_url(download_url: str) -> str:
@@ -285,7 +326,9 @@ def fix_download_url(download_url: str) -> str:
 
 
 def fallback_page_title(url: str, current: str) -> str:
-    if (current or "").strip().lower() not in GENERIC_TITLES:
+    cur = (current or "").strip()
+    # torah-dl sometimes returns just the honorific ("Rabbi", "Mr.") as the title
+    if cur.lower().rstrip(".'") not in GENERIC_TITLES and len(cur.split()) > 1:
         return current
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
@@ -702,6 +745,45 @@ def sentences_to_vtt(sentences: list) -> str:
     return "\n".join(lines)
 
 
+def render_book_view(item: dict, audio_path: str, data: dict, kp: str = ""):
+    """Book-style reader: clean paragraphs, text size, downloads."""
+    paras = build_paragraphs(data.get("words") or data.get("sentences", []))
+    subtitle_bits = [b for b in (item.get("teacher"), item.get("provider")) if b and b != "Unknown"]
+    c_size, c_times = st.columns([3, 2])
+    with c_size:
+        size = st.select_slider(
+            "Text size", options=["Small", "Medium", "Large", "Extra large"],
+            value="Medium", key=f"{kp}book_size",
+        )
+    with c_times:
+        show_times = st.toggle("Show times", value=False, key=f"{kp}book_times")
+    font_px = {"Small": 16, "Medium": 19, "Large": 22, "Extra large": 26}[size]
+    with st.expander("🎧 Listen while reading", expanded=False):
+        st.audio(audio_path)
+    st.markdown(
+        paragraphs_to_html(paras, title=item.get("title", ""),
+                           subtitle=" · ".join(subtitle_bits),
+                           font_px=font_px, show_times=show_times),
+        unsafe_allow_html=True,
+    )
+    st.caption(f"{len(paras)} paragraphs")
+    base_name = safe_filename(item.get("title", "shiur"), 60)
+    d1, d2 = st.columns(2)
+    with d1:
+        st.download_button(
+            "⬇️ Download as text (.txt)",
+            data=paragraphs_to_text(paras, item.get("title", "")),
+            file_name=f"{base_name}.txt", mime="text/plain",
+            key=f"{kp}dl_book_txt_{item['id']}",
+        )
+    with d2:
+        st.download_button(
+            "⬇️ Download as Markdown (.md)",
+            data=paragraphs_to_text(paras, item.get("title", ""), markdown=True),
+            file_name=f"{base_name}.md", mime="text/markdown",
+            key=f"{kp}dl_book_md_{item['id']}",
+        )
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -1052,6 +1134,176 @@ Rabbi Hershel Reichman""",
     st.markdown("- [ElevenLabs](https://elevenlabs.io) → API Key")
     st.markdown("- [AssemblyAI](https://www.assemblyai.com) → API Key")
 
+# ---------------------------------------------------------------------------
+# Quick add: link from ?url=..., clipboard button, or paste box (auto-starts)
+# ---------------------------------------------------------------------------
+_LINK_CATCHER_HTML = """
+<div class="lc">
+  <button type="button" class="lc-btn">📋 Paste link &amp; transcribe</button>
+  <input class="lc-in" type="text" inputmode="url" autocomplete="off"
+         placeholder="…or paste a Torah Anytime / YUTorah link here" />
+  <div class="lc-msg"></div>
+</div>
+"""
+_LINK_CATCHER_CSS = """
+.lc { display:flex; flex-direction:column; gap:10px; font-family: var(--st-font, sans-serif); }
+.lc-btn { font-size:1.15rem; font-weight:600; padding:16px 12px; border-radius:12px; border:none;
+          background: var(--st-primary-color, #ff4b4b); color:#fff; cursor:pointer; width:100%; }
+.lc-btn:active { opacity:.8; }
+.lc-in { font-size:1rem; padding:12px; border-radius:10px; width:100%; box-sizing:border-box;
+         border:1px solid rgba(128,128,128,.5); background: transparent; color: inherit; }
+.lc-msg { font-size:.9rem; min-height:1.1em; opacity:.85; }
+"""
+_LINK_CATCHER_JS = r"""
+const LECTURE_RE = /(mytat\.me\/[av]\d+|torahanytime\.com\/\S*(lectures\/|[?&#]v=)\d+|yutorah\.org\/\S*\d{3,})/i;
+export default function(component) {
+  const { setTriggerValue, parentElement } = component;
+  const btn = parentElement.querySelector('.lc-btn');
+  const inp = parentElement.querySelector('.lc-in');
+  const msg = parentElement.querySelector('.lc-msg');
+  let last = '';
+  const send = (text, how) => {
+    text = (text || '').trim();
+    if (!text) { msg.textContent = 'Clipboard is empty — copy the shiur link first.'; return; }
+    if (!LECTURE_RE.test(text) && !/^\d+$/.test(text) && !/https?:\/\//i.test(text)) {
+      msg.textContent = "That doesn't look like a shiur link.";
+      return;
+    }
+    if (text === last) return;
+    last = text;
+    msg.textContent = 'Got it — starting…';
+    setTriggerValue('link', text + '\u0000' + how + '\u0000' + Date.now());
+  };
+  btn.onclick = async () => {
+    try {
+      const t = await navigator.clipboard.readText();
+      inp.value = t || '';
+      send(t, 'clipboard');
+    } catch (e) {
+      msg.textContent = "Couldn't read the clipboard. Long-press the box below and tap Paste.";
+      inp.focus();
+    }
+  };
+  const onTyped = () => {
+    const t = inp.value;
+    if (LECTURE_RE.test(t) || /^\s*\d{4,}\s*$/.test(t)) send(t, 'paste');
+  };
+  inp.oninput = onTyped;
+  inp.onpaste = () => setTimeout(onTyped, 0);
+  inp.onkeydown = (e) => { if (e.key === 'Enter') send(inp.value, 'enter'); };
+}
+"""
+
+_link_catcher = None
+try:
+    import streamlit.components.v2 as _cv2
+    _link_catcher = _cv2.component(
+        "shiur_link_catcher", html=_LINK_CATCHER_HTML, css=_LINK_CATCHER_CSS, js=_LINK_CATCHER_JS,
+    )
+except Exception:
+    _link_catcher = None
+
+
+def find_library_item(item_id: str) -> dict | None:
+    p = LIBRARY_DIR / f"{item_id}.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p, encoding="utf-8") as fh:
+            it = json.load(fh)
+    except Exception:
+        return None
+    tp = it.get("transcript_path")
+    return it if tp and Path(tp).exists() else None
+
+
+def quick_transcribe(url: str) -> dict | None:
+    """Download + transcribe one link, save to the library. Reuses an existing transcript."""
+    existing = find_library_item(md5_id(normalize_source_url(url)))
+    if existing:
+        return existing
+    with st.status("Working on your shiur…", expanded=True) as status:
+        st.write(f"Downloading `{url}`")
+        meta = download_from_url(url)
+        if not meta:
+            status.update(label="Download failed", state="error")
+            return None
+        st.write(f"**{meta['title']}** — transcribing with {provider}. Long shiurim can take a few minutes; keep this page open.")
+        words = run_transcription(meta["audio_path"], provider, eleven_key, assembly_key, local_model, keyterms=keyterms)
+        if not words:
+            status.update(label="Transcription failed", state="error")
+            return None
+        sentences = group_words_into_sentences(words)
+        tp = TRANSCRIPTS_DIR / f"{meta['id']}.json"
+        with open(tp, "w", encoding="utf-8") as f:
+            json.dump({"words": words, "sentences": sentences}, f, ensure_ascii=False, indent=2)
+        meta["transcript_path"] = str(tp)
+        meta["num_sentences"] = len(sentences)
+        meta["provider"] = provider
+        if "torahanytime.com" in url.lower():
+            meta["source"] = "TorahAnytime"
+        save_library_item(meta)
+        status.update(label=f"Done — {meta['title']}", state="complete", expanded=False)
+    return meta
+
+
+st.subheader("⚡ Quick add")
+st.caption("In Torah Anytime tap **Share → Copy**, then come back here and tap the button.")
+
+pending = None
+# 1) Link handed over in the address: ?url=<link or whole share text>
+qp_raw = st.query_params.get("url") or st.query_params.get("text") or st.query_params.get("link")
+if qp_raw:
+    qp_url = extract_shiur_url(qp_raw)
+    if qp_url and st.session_state.get("qp_done") != qp_raw:
+        st.session_state["qp_done"] = qp_raw
+        pending = qp_url
+    elif not qp_url:
+        st.warning("The link that was passed in doesn't look like a shiur link.")
+
+# 2) Clipboard button / auto-start paste box
+if _link_catcher is not None:
+    lc = _link_catcher(key="link_catcher", on_link_change=lambda: None)
+    raw = getattr(lc, "link", None) if lc is not None else None
+    if raw:
+        text = str(raw).split("\u0000")[0]
+        got = extract_shiur_url(text)
+        if got:
+            pending = got
+        else:
+            st.warning("Couldn't find a shiur link in what was pasted.")
+else:
+    typed = st.text_input("Paste a Torah Anytime / YUTorah link", key="quick_link")
+    if typed and st.session_state.get("quick_link_done") != typed:
+        got = extract_shiur_url(typed)
+        if got:
+            st.session_state["quick_link_done"] = typed
+            pending = got
+
+if pending:
+    done = quick_transcribe(pending)
+    if done:
+        st.session_state["quick_item_id"] = done["id"]
+    if "url" in st.query_params or "text" in st.query_params or "link" in st.query_params:
+        st.query_params.clear()  # so a refresh doesn't start it again
+
+qid = st.session_state.get("quick_item_id")
+if qid:
+    qitem = find_library_item(qid)
+    if qitem:
+        with open(qitem["transcript_path"], encoding="utf-8") as f:
+            qdata = json.load(f)
+        top_l, top_r = st.columns([4, 1])
+        with top_l:
+            st.success(f"Ready: **{qitem['title']}** (also saved in My Library)")
+        with top_r:
+            if st.button("✖ Close", key="quick_close"):
+                st.session_state.pop("quick_item_id", None)
+                st.rerun()
+        render_book_view(qitem, qitem["audio_path"], qdata, kp="quick_")
+
+st.divider()
+
 tab_search, tab_tat, tab_batch, tab_library, tab_fullsearch = st.tabs([
     "🔎 Search YUTorah",
     "🟠 Torah Anytime",
@@ -1148,11 +1400,12 @@ with tab_tat:
         lines = [ln.strip() for ln in tat_urls.splitlines() if ln.strip()]
         urls = []
         for ln in lines:
-            if ln.isdigit():
-                urls.append(f"https://www.torahanytime.com/lectures/{ln}")
-            elif ln.startswith("http") or "v=" in ln or "lectures" in ln.lower() or "mytat.me" in ln.lower():
-                candidate = ln if ln.startswith("http") else f"https://www.torahanytime.com/{ln.lstrip('#/')}"
-                urls.append(normalize_source_url(candidate))
+            got = extract_shiur_url(ln)
+            if not got and ("v=" in ln or "lectures" in ln.lower()):
+                got = normalize_source_url(f"https://www.torahanytime.com/{ln.lstrip('#/')}")
+            if got:
+                if got not in urls:
+                    urls.append(got)
             else:
                 st.warning(f"Skipped unrecognized line: {ln}")
         if not urls:
@@ -1191,7 +1444,11 @@ with tab_batch:
     urls_text = st.text_area("URLs", height=150, placeholder="https://www.yutorah.org/lectures/details?shiurid=...\nhttps://www.torahanytime.com/...")
 
     if st.button("Process all", type="primary"):
-        urls = [normalize_source_url(u.strip()) for u in urls_text.splitlines() if u.strip().startswith("http")]
+        urls = []
+        for u in urls_text.splitlines():
+            got = extract_shiur_url(u)
+            if got and got not in urls:
+                urls.append(got)
         if not urls:
             st.warning("No valid URLs found")
         else:
@@ -1250,42 +1507,7 @@ with tab_library:
                 help="Book: clean paragraphs to read. Interactive player: tap a sentence to jump the audio there.",
             )
             if view == "📖 Book":
-                paras = build_paragraphs(data.get("words") or data.get("sentences", []))
-                subtitle_bits = [b for b in (item.get("teacher"), item.get("provider")) if b and b != "Unknown"]
-                c_size, c_times = st.columns([3, 2])
-                with c_size:
-                    size = st.select_slider(
-                        "Text size", options=["Small", "Medium", "Large", "Extra large"],
-                        value="Medium", key="book_size",
-                    )
-                with c_times:
-                    show_times = st.toggle("Show times", value=False, key="book_times")
-                font_px = {"Small": 16, "Medium": 19, "Large": 22, "Extra large": 26}[size]
-                with st.expander("🎧 Listen while reading", expanded=False):
-                    st.audio(audio_path)
-                st.markdown(
-                    paragraphs_to_html(paras, title=item.get("title", ""),
-                                       subtitle=" · ".join(subtitle_bits),
-                                       font_px=font_px, show_times=show_times),
-                    unsafe_allow_html=True,
-                )
-                st.caption(f"{len(paras)} paragraphs")
-                base_name = safe_filename(item.get("title", "shiur"), 60)
-                d1, d2 = st.columns(2)
-                with d1:
-                    st.download_button(
-                        "⬇️ Download as text (.txt)",
-                        data=paragraphs_to_text(paras, item.get("title", "")),
-                        file_name=f"{base_name}.txt", mime="text/plain",
-                        key=f"dl_book_txt_{item['id']}",
-                    )
-                with d2:
-                    st.download_button(
-                        "⬇️ Download as Markdown (.md)",
-                        data=paragraphs_to_text(paras, item.get("title", ""), markdown=True),
-                        file_name=f"{base_name}.md", mime="text/markdown",
-                        key=f"dl_book_md_{item['id']}",
-                    )
+                render_book_view(item, audio_path, data)
             else:
                 filt = st.text_input("Filter sentences in this shiur", key="lib_filter")
                 if filt:
