@@ -20,6 +20,8 @@ import html as html_lib
 import base64
 import re
 
+from book import build_paragraphs, paragraphs_to_html, paragraphs_to_text
+
 # Optional imports
 try:
     from torah_dl import extract as torah_extract
@@ -410,8 +412,9 @@ def transcribe_elevenlabs(audio_path: str, api_key: str, keyterms: list | None =
     client = ElevenLabs(api_key=api_key)
     kwargs = dict(
         model_id="scribe_v2",
-        diarize=False,
+        diarize=True,          # speaker labels in the book view when speakers change
         tag_audio_events=False,
+        no_verbatim=True,      # drop "um", "uh", false starts
     )
     # keyterms / keyterm prompting (up to 1000 terms on Scribe; we send up to 200)
     if keyterms:
@@ -420,8 +423,9 @@ def transcribe_elevenlabs(audio_path: str, api_key: str, keyterms: list | None =
         with open(audio_path, "rb") as f:
             result = client.speech_to_text.convert(file=f, **kwargs)
     except TypeError:
-        # older SDK without keyterms param – retry without
+        # older SDK without some params – retry without them
         kwargs.pop("keyterms", None)
+        kwargs.pop("no_verbatim", None)
         try:
             with open(audio_path, "rb") as f:
                 result = client.speech_to_text.convert(file=f, **kwargs)
@@ -439,7 +443,11 @@ def transcribe_elevenlabs(audio_path: str, api_key: str, keyterms: list | None =
         text = (getattr(w, "text", "") or "").strip()
         start, end = getattr(w, "start", None), getattr(w, "end", None)
         if text and start is not None and end is not None:
-            words.append({"text": text, "start": float(start), "end": float(end)})
+            wd = {"text": text, "start": float(start), "end": float(end)}
+            sp = getattr(w, "speaker_id", None)
+            if sp is not None:
+                wd["speaker"] = str(sp)
+            words.append(wd)
     if not words and getattr(result, "text", None):
         words = [{"text": result.text, "start": 0.0, "end": 0.0}]
     return words
@@ -452,7 +460,13 @@ def transcribe_assemblyai(audio_path: str, api_key: str, keyterms: list | None =
         st.error("pip install assemblyai")
         return None
     aai.settings.api_key = api_key
-    cfg_kwargs = dict(language_detection=True)
+    cfg_kwargs = dict(
+        language_detection=True,
+        punctuate=True,
+        format_text=True,
+        disfluencies=False,   # leave out "um", "uh"
+        speaker_labels=True,
+    )
     boost = sanitize_assembly_terms(keyterms, limit=1000) if keyterms else []
     if boost:
         # Newer models prefer keyterms_prompt; word_boost still works (Universal-2).
@@ -466,24 +480,41 @@ def transcribe_assemblyai(audio_path: str, api_key: str, keyterms: list | None =
         else:
             cfg_kwargs["word_boost"] = boost
             cfg_kwargs["boost_param"] = "high"
-    config = aai.TranscriptionConfig(**cfg_kwargs)
     try:
-        transcript = aai.Transcriber().transcribe(audio_path, config)
+        transcript = aai.Transcriber().transcribe(audio_path, aai.TranscriptionConfig(**cfg_kwargs))
+        if transcript.status == aai.TranscriptStatus.error and "speaker" in (transcript.error or "").lower():
+            # some languages don't support speaker labels – retry without them
+            cfg_kwargs.pop("speaker_labels", None)
+            transcript = aai.Transcriber().transcribe(audio_path, aai.TranscriptionConfig(**cfg_kwargs))
     except Exception as e:
         st.error(f"AssemblyAI: {e}")
         return None
     if transcript.status == aai.TranscriptStatus.error:
         st.error(transcript.error)
         return None
+    # AssemblyAI's own paragraph breaks (GET /v2/transcript/{id}/paragraphs)
+    para_bounds = []
+    try:
+        para_bounds = [((p.start or 0) / 1000.0, (p.end or 0) / 1000.0) for p in transcript.get_paragraphs()]
+    except Exception:
+        para_bounds = []
     words = []
+    pi = 0
     for w in transcript.words or []:
         text_w = (w.text or "").strip()
         if text_w:
-            words.append({
+            wd = {
                 "text": text_w,
                 "start": (w.start or 0) / 1000.0,
                 "end": (w.end or 0) / 1000.0,
-            })
+            }
+            if getattr(w, "speaker", None):
+                wd["speaker"] = str(w.speaker)
+            if para_bounds:
+                while pi < len(para_bounds) - 1 and wd["start"] >= para_bounds[pi + 1][0] - 1e-3:
+                    pi += 1
+                wd["p"] = pi
+            words.append(wd)
     return words
 
 
@@ -678,7 +709,7 @@ st.set_page_config(
     page_title="Shiur Transcriber",
     page_icon="📖",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",  # collapsed on phones so the reader gets the full screen
 )
 
 st.title("📖 Shiur Transcriber & Interactive Player")
@@ -1025,7 +1056,7 @@ tab_search, tab_tat, tab_batch, tab_library, tab_fullsearch = st.tabs([
     "🔎 Search YUTorah",
     "🟠 Torah Anytime",
     "📦 Batch / Paste URLs",
-    "📚 My Library & Player",
+    "📚 My Library & Reader",
     "🔍 Search My Transcripts",
 ])
 
@@ -1211,48 +1242,93 @@ with tab_library:
                 data = json.load(f)
             sentences = data.get("sentences", [])
 
-            filt = st.text_input("Filter sentences in this shiur", key="lib_filter")
-            if filt:
-                sentences = [s for s in sentences if filt.lower() in s["text"].lower()]
-
-            st.markdown("**Export timed captions**")
-            col_srt, col_vtt = st.columns(2)
-            with col_srt:
-                if st.button("Generate SRT", key=f"srt_btn_{item['id']}"):
-                    srt_content = sentences_to_srt(sentences)
-                    st.session_state[f"srt_{item['id']}"] = srt_content
-                if f"srt_{item['id']}" in st.session_state:
-                    srt_content = st.session_state[f"srt_{item['id']}"]
-                    st.download_button(
-                        "Download .srt",
-                        data=srt_content,
-                        file_name=f"{item.get('title','shiur')[:40]}.srt",
-                        mime="text/plain",
-                        key=f"dl_srt_{item['id']}",
+            view = st.radio(
+                "View",
+                ["📖 Book", "🎧 Interactive player"],
+                horizontal=True,
+                key="lib_view",
+                help="Book: clean paragraphs to read. Interactive player: tap a sentence to jump the audio there.",
+            )
+            if view == "📖 Book":
+                paras = build_paragraphs(data.get("words") or data.get("sentences", []))
+                subtitle_bits = [b for b in (item.get("teacher"), item.get("provider")) if b and b != "Unknown"]
+                c_size, c_times = st.columns([3, 2])
+                with c_size:
+                    size = st.select_slider(
+                        "Text size", options=["Small", "Medium", "Large", "Extra large"],
+                        value="Medium", key="book_size",
                     )
-                    if st.button("Copy SRT to clipboard", key=f"copy_srt_{item['id']}"):
-                        st.code(srt_content, language="text")
-                        st.success("SRT shown above — select all and copy (Ctrl/Cmd+C)")
-            with col_vtt:
-                if st.button("Generate VTT", key=f"vtt_btn_{item['id']}"):
-                    vtt_content = sentences_to_vtt(sentences)
-                    st.session_state[f"vtt_{item['id']}"] = vtt_content
-                if f"vtt_{item['id']}" in st.session_state:
-                    vtt_content = st.session_state[f"vtt_{item['id']}"]
+                with c_times:
+                    show_times = st.toggle("Show times", value=False, key="book_times")
+                font_px = {"Small": 16, "Medium": 19, "Large": 22, "Extra large": 26}[size]
+                with st.expander("🎧 Listen while reading", expanded=False):
+                    st.audio(audio_path)
+                st.markdown(
+                    paragraphs_to_html(paras, title=item.get("title", ""),
+                                       subtitle=" · ".join(subtitle_bits),
+                                       font_px=font_px, show_times=show_times),
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"{len(paras)} paragraphs")
+                base_name = safe_filename(item.get("title", "shiur"), 60)
+                d1, d2 = st.columns(2)
+                with d1:
                     st.download_button(
-                        "Download .vtt",
-                        data=vtt_content,
-                        file_name=f"{item.get('title','shiur')[:40]}.vtt",
-                        mime="text/vtt",
-                        key=f"dl_vtt_{item['id']}",
+                        "⬇️ Download as text (.txt)",
+                        data=paragraphs_to_text(paras, item.get("title", "")),
+                        file_name=f"{base_name}.txt", mime="text/plain",
+                        key=f"dl_book_txt_{item['id']}",
                     )
-                    if st.button("Copy VTT to clipboard", key=f"copy_vtt_{item['id']}"):
-                        st.code(vtt_content, language="text")
-                        st.success("VTT shown above — select all and copy (Ctrl/Cmd+C)")
-            st.caption("SRT works in VLC, YouTube, most players. VTT (WebVTT) is the web standard used by HTML5 video and many podcast apps.")
+                with d2:
+                    st.download_button(
+                        "⬇️ Download as Markdown (.md)",
+                        data=paragraphs_to_text(paras, item.get("title", ""), markdown=True),
+                        file_name=f"{base_name}.md", mime="text/markdown",
+                        key=f"dl_book_md_{item['id']}",
+                    )
+            else:
+                filt = st.text_input("Filter sentences in this shiur", key="lib_filter")
+                if filt:
+                    sentences = [s for s in sentences if filt.lower() in s["text"].lower()]
 
-            st.markdown("**Click any sentence below → audio jumps to that exact moment.**")
-            render_interactive_player(audio_path, sentences, height=700)
+                st.markdown("**Export timed captions**")
+                col_srt, col_vtt = st.columns(2)
+                with col_srt:
+                    if st.button("Generate SRT", key=f"srt_btn_{item['id']}"):
+                        srt_content = sentences_to_srt(sentences)
+                        st.session_state[f"srt_{item['id']}"] = srt_content
+                    if f"srt_{item['id']}" in st.session_state:
+                        srt_content = st.session_state[f"srt_{item['id']}"]
+                        st.download_button(
+                            "Download .srt",
+                            data=srt_content,
+                            file_name=f"{item.get('title','shiur')[:40]}.srt",
+                            mime="text/plain",
+                            key=f"dl_srt_{item['id']}",
+                        )
+                        if st.button("Copy SRT to clipboard", key=f"copy_srt_{item['id']}"):
+                            st.code(srt_content, language="text")
+                            st.success("SRT shown above — select all and copy (Ctrl/Cmd+C)")
+                with col_vtt:
+                    if st.button("Generate VTT", key=f"vtt_btn_{item['id']}"):
+                        vtt_content = sentences_to_vtt(sentences)
+                        st.session_state[f"vtt_{item['id']}"] = vtt_content
+                    if f"vtt_{item['id']}" in st.session_state:
+                        vtt_content = st.session_state[f"vtt_{item['id']}"]
+                        st.download_button(
+                            "Download .vtt",
+                            data=vtt_content,
+                            file_name=f"{item.get('title','shiur')[:40]}.vtt",
+                            mime="text/vtt",
+                            key=f"dl_vtt_{item['id']}",
+                        )
+                        if st.button("Copy VTT to clipboard", key=f"copy_vtt_{item['id']}"):
+                            st.code(vtt_content, language="text")
+                            st.success("VTT shown above — select all and copy (Ctrl/Cmd+C)")
+                st.caption("SRT works in VLC, YouTube, most players. VTT (WebVTT) is the web standard used by HTML5 video and many podcast apps.")
+
+                st.markdown("**Click any sentence below → audio jumps to that exact moment.**")
+                render_interactive_player(audio_path, sentences, height=700)
         else:
             st.warning("Audio or transcript missing for this entry.")
 

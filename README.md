@@ -69,7 +69,7 @@ YUTorah search and Torah Anytime / YUTorah URL extraction do not need an API key
 - **Search YUTorah** → find any shiur → one-click “Add + Transcribe”
 - **Torah Anytime** → the site has no public search API, so search on [torahanytime.com](https://www.torahanytime.com), copy lecture links or IDs, and paste them here
 - **Batch / Paste URLs** → paste many YUTorah or Torah Anytime links
-- **My Library & Player** → click any sentence to jump the audio; generate SRT or VTT
+- **My Library & Reader** → 📖 **Book** view (default): the transcript as clean, book-style paragraphs (serif type, adjustable text size, speaker names only when the speaker changes, Hebrew shown right-to-left), with .txt / .md download. Switch to 🎧 **Interactive player** to tap any sentence and jump the audio; generate SRT or VTT
 - **Search My Transcripts** → find phrases across everything you’ve processed
 
 ## Custom vocabulary (Hebrew / Torah terms)
