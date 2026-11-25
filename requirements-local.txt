@@ -1,0 +1,5 @@
+# Optional local Whisper stack. Too heavy for Streamlit Community Cloud (~1 GB RAM).
+# Install on a machine with enough memory: pip install -r requirements-local.txt
+-r requirements.txt
+faster-whisper
+torch
